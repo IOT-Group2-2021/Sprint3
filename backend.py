@@ -18,6 +18,7 @@ import datetime
 import dateutil.parser as dparse
 import dateutil.relativedelta as rdelta
 import socket
+import threading
 import mysql.connector
 """
 app_id = "iotheig"
@@ -33,9 +34,15 @@ access_key = "ttn-account-v2.h8BAs1uaCqT5y0vA1dEkqwz-yfvtCDUs-qx2na7aOiY"
 node1 = "test-iot-group2-2021"
 node2 = "test-iot-group2-2021-node2"
 port_node1 = "1"
+port_node2 = "2"
 
 type_value = {3302: "Presence", 3303: "Temperature", 3304: "Humidity", 3315: "Pressure", 3324: "Loudness", 3325: "Concentration"}
 symbol = {3302: "", 3303: "°C", 3304: "%", 3315: "hPa", 3324: "mV", 3325: "ppm"}
+
+HOST_SRC = '0.0.0.0'  # The server's hostname or IP address
+PORT_SRC = 64003        # The port used by the server
+HOST_DST = '0.0.0.0'  # The server's hostname or IP address
+PORT_DST = 56781        # The port used by the server
 
 # Classe pour exception personnalisé
 class Error(Exception):
@@ -47,8 +54,111 @@ class ErrorValue(Error):
 class ErrorType(Error):
     pass
 
-class ErrorNode(Error):
-    pass
+# Ecriture de la valeur reçue du capteur de chaleur dans la DB MySQL
+def insert_db(datetime, data, node):
+    mycursor = mydb.cursor()
+    sql = ""
+    val = ()
+    if node == node1:
+        val = (datetime, float(data))
+        sql = "INSERT INTO heatsensor (datetime, temperature) VALUES (%s,%s)"
+    elif node == node2:
+        sql = "INSERT INTO noisesensor (datetime) VALUE (%s)"
+        val = (datetime,)
+    mycursor.execute(sql, val)
+    mydb.commit()
+
+# Envoie des données vers l'autre backend
+def send_data(dt, data):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect((HOST_DST, PORT_DST))
+        s.sendall(data)
+
+        f = open("logs.log", "a+")
+        f.write(dt + " - Envoi de data vers le backend2\n")
+        f.close()
+    except:
+        f = open("logs.log", "a+")
+        f.write(dt + " - Error: Le serveur backend2 est indisponible (timeout 5 sec)\n")
+        f.close()
+
+def socket_server():
+    f = None
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind((HOST_SRC, PORT_SRC))
+    s.listen()
+    
+    try:
+        while True:
+            dt = datetime.datetime.now().strftime("%Y-%m-%d %X")
+            data = bytearray()
+
+            f = open("server_socket.log", "a+")
+            f.write("Waiting for a connection...\n")
+            f.flush()
+
+            (conn, addr) = s.accept()
+            f.write('Connected from: ' + addr[0] + "\n")
+            f.flush()
+            f.close()
+
+            while True:
+                d = conn.recv(32)
+                data += d
+                if not d:
+                    break
+
+            f = open("logs.log", "a+")
+            f.write(dt+" - Reçu de backend2\n")
+            f.close()
+
+            f = open("server_socket.log", "a+")
+            f.write('Disconnected from: ' + addr[0] + "\n")
+            f.close()
+            
+            try:
+                values = parser_data(bytearray(data))
+                
+                for value in values:
+                    if(not check_values(value[0], value[1])):
+                        raise ErrorValue
+                    if(value[0] == 3304):
+                        msg = (value[0]).to_bytes(2, "big") + (value[1] *2).to_bytes(1, "big")
+                        msg = base64.b64encode(msg)
+                        publish_node(msg, node1, port_node1)
+                    elif(value[0] == 3325):
+                        msg = (value[0]).to_bytes(2, "big") + (value[1]).to_bytes(2, "big")
+                        msg = base64.b64encode(msg)
+                        publish_node(msg, node2, port_node2)
+
+                log_values(dt, "backend2", values)
+                
+                # Ajout à la DB
+                # TODO
+
+            except ErrorType:
+                f = open("logs.log", "a+")
+                f.write(dt + " - ERROR backend2 : Le type d'une valeur reçue depuis le payload n'est pas valide\n")
+                f.close()
+            except ErrorValue:
+                f = open("logs.log", "a+")
+                f.write(dt + " - ERROR backend2 : Une des valeurs reçues du payload n'est pas valide\n")
+                f.close()
+            except:
+                f = open("logs.log", "a+")
+                f.write(dt + " - ERROR backend2: Erreur inconnue avec les données reçues de backend2\n")
+                f.close()
+    except:
+        f = open("server_socket.log", "a+")
+        f.write("Error Socket TCP: erreur avec le daemon socket TCP. Arrêt du socket...\n")
+    finally:
+        s.close()    
+
+# Envoie des données vers des Nodes du réseau
+def publish_node(message, node, port_node):
+    client.publish(app_id + "/devices/" + node + "/down", '{"port": ' + port_node + ',"confirmed": false,"payload_raw": "' + message + '"}')
 
 # Log les valeurs passées en arguments dans le fichier logs.log
 def log_values(dt, topic, values):
@@ -79,7 +189,6 @@ def check_values(type, value):
     elif(type == 3325):
         return True if 400 <= value <= 60000 else False
     else:
-        print("error")
         raise ErrorValue
 
 # Parser les données reçues par le payload
@@ -147,7 +256,6 @@ def on_log(client, userdata, level, buf):
 
 # Callback quand un message PUBLISH est reçu depuis le serveur.
 def on_message(client, userdata, msg):
-    data = None
     # Parsing du payload reçu
     j = json.loads(msg.payload)
 
@@ -165,7 +273,6 @@ def on_message(client, userdata, msg):
         try:
             # Transformation du payload de base64 à bytes
             payload_decode = base64.b64decode(payload_raw)
-            print("base64 to byte done")
 
             # Ecriture des informations du payload reçu dans un fichier log
             # (Datetime + Topic qui a envoyé le payload + payload entier)
@@ -175,43 +282,26 @@ def on_message(client, userdata, msg):
             f.write(str(msg.payload))
             f.write("\n")
             f.close()
-            print("log du payload raw")
-
-            # Capture de la portion de data à l'autre groupe pour l'envoi
-            if(dev_id == node1):
-                data = payload_decode[:3]
-            elif(dev_id == node2):
-                data = payload_decode[:4]
-            else:
-                raise ErrorNode
-            print("capture data pour autre groupe done")
 
             # Parser les valeurs contenues dans le payload initial
             values = parser_data(bytearray(payload_decode))
-            print("values parsé")
 
             # Vérifier chaque valeur selon leur barême
             for value in values:
                 if(not check_values(value[0], value[1])):
                     raise ErrorValue
-            print("values OK")
 
             # Log les valeurs reçus
             log_values(dt, dev_id, values)
-            print("log des values done")
 
             # Ajout des valeurs dans la DB
             # TODO
-            print("values ajouté à la DB")
 
             # Envoi des datas pour l'autre groupe
-            print(data)
-            print("data envoyé à l'autre groupe")
+            thread = threading.Thread(target=send_data, args=(dt, payload_decode))
+            thread.start()
+            thread.join()
         
-        except ErrorNode:
-            f = open("logs.log", "a+")
-            f.write(dt + " - ERROR : Le Node qui a envoyé le dernier paquet n'est pas valide\n")
-            f.close()
         except ErrorType:
             f = open("logs.log", "a+")
             f.write(dt + " - ERROR : Le type d'une valeur reçue depuis le payload n'est pas valide\n")
@@ -231,6 +321,9 @@ mydb = mysql.connector.connect(
     password="IOTgroup2$",
     database="iot-group2"
 )
+
+thread = threading.Thread(target=socket_server, daemon=True)
+thread.start()
 
 client = mqtt.Client()
 client.on_connect = on_connect
