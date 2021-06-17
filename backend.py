@@ -147,7 +147,7 @@ def socket_server():
                 f.close()
 
                 # Envoi à Telegram les données reçues
-                create_message(dt, topic, values, type_value, symbol)
+                create_message(dt, dev_id, values, type_value, symbol)
 
                 # Ajout à la DB
                 for value in values:
